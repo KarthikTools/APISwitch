@@ -1,0 +1,16 @@
+{
+  "name": "playwrightUIAPI",
+  "version": "1.0.0",
+  "description": "An automation framework using Playwright with fallback to API execution and logging.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "author": "Karthik Marimuthu",
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.0.0",
+    "node-fetch": "^2.6.1",
+    "winston": "^3.3.3"
+  }
+}
