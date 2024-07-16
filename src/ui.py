@@ -2,12 +2,34 @@ import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output, State
 import boto3
-import datetime
+from botocore.exceptions import NoCredentialsError, ClientError
+from urllib.parse import urlparse
 
 app = dash.Dash(__name__)
 
+# Function to download file from S3
+def download_file_from_s3(access_key, secret_key, endpoint, file_name, verify_ssl=False):
+    parsed_url = urlparse(endpoint)
+    host = parsed_url.hostname
+    port = parsed_url.port
+    path_parts = parsed_url.path.lstrip('/').split('/')
+    bucket_name = path_parts[0]  # Assuming the first part is the bucket name
+    file_key = '/'.join(path_parts[1:] + [file_name])
+    session = boto3.Session(
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    )
+    s3_client = session.client('s3', endpoint_url=f"https://{host}:{port}", verify=verify_ssl)
+    try:
+        response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
+        data = response['Body'].read().decode('utf-8')
+        return data
+    except NoCredentialsError:
+        return "Credentials not available"
+    except ClientError as e:
+        return f"Client error: {e}"
+
 # AWS S3 Configuration
-s3 = boto3.client('s3')
 env_buckets = {
     'QA': {
         'ack': 'gdg0-q-adapter-global-disbursements',
@@ -19,8 +41,8 @@ env_buckets = {
     }
 }
 
-def list_files(bucket_name, prefix=''):
-    response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+def list_files(bucket_name):
+    response = s3.list_objects_v2(Bucket=bucket_name)
     files = [obj['Key'] for obj in response.get('Contents', [])]
     return files
 
@@ -97,7 +119,7 @@ def update_output(n_clicks, selected_env, selected_bucket, selected_type, input_
     if n_clicks is None or not all([selected_env, selected_bucket, selected_type, input_value]):
         return ''
 
-    bucket_name = env_buckets[selected_env]['ack' if selected_type != 'PSR' else 'psr']
+    bucket_name = selected_bucket
     files = search_files(bucket_name, input_value)
 
     links = [html.A(file, href=f'https://{bucket_name}.s3.amazonaws.com/{file}', target='_blank') for file in files]
