@@ -29,7 +29,33 @@ def download_file_from_s3(access_key, secret_key, endpoint, file_name, verify_ss
     except ClientError as e:
         return f"Client error: {e}"
 
-# AWS S3 Configuration
+# Initialize the S3 client
+def initialize_s3_client(access_key, secret_key, endpoint, verify_ssl=False):
+    parsed_url = urlparse(endpoint)
+    host = parsed_url.hostname
+    port = parsed_url.port
+    session = boto3.Session(
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    )
+    s3_client = session.client('s3', endpoint_url=f"https://{host}:{port}", verify=verify_ssl)
+    return s3_client
+
+# Function to list files in a bucket
+def list_files(s3_client, bucket_name):
+    try:
+        response = s3_client.list_objects_v2(Bucket=bucket_name)
+        files = [obj['Key'] for obj in response.get('Contents', [])]
+        return files
+    except ClientError as e:
+        return []
+
+# Function to search files containing a specific term
+def search_files(s3_client, bucket_name, search_term):
+    files = list_files(s3_client, bucket_name)
+    return [file for file in files if search_term in file]
+
+# Define environment buckets
 env_buckets = {
     'QA': {
         'ack': 'gdg0-q-adapter-global-disbursements',
@@ -41,15 +67,7 @@ env_buckets = {
     }
 }
 
-def list_files(bucket_name):
-    response = s3.list_objects_v2(Bucket=bucket_name)
-    files = [obj['Key'] for obj in response.get('Contents', [])]
-    return files
-
-def search_files(bucket_name, search_term):
-    files = list_files(bucket_name)
-    return [file for file in files if search_term in file]
-
+# Define the Dash app layout
 app.layout = html.Div([
     html.H1('S3 File Viewer'),
 
@@ -88,6 +106,7 @@ app.layout = html.Div([
     )
 ])
 
+# Update bucket options based on selected environment
 @app.callback(
     Output('bucket-dropdown', 'options'),
     [Input('env-dropdown', 'value')]
@@ -99,6 +118,7 @@ def set_bucket_options(selected_env):
         return options
     return []
 
+# Update input box based on selected type
 @app.callback(
     Output('input-container', 'children'),
     [Input('type-dropdown', 'value')]
@@ -110,6 +130,7 @@ def set_input_box(selected_type):
         return dcc.Input(id='input-box', type='text', placeholder='Enter rail-bulk-id')
     return ''
 
+# Display search results
 @app.callback(
     Output('file-links', 'children'),
     [Input('search-button', 'n_clicks')],
@@ -119,10 +140,15 @@ def update_output(n_clicks, selected_env, selected_bucket, selected_type, input_
     if n_clicks is None or not all([selected_env, selected_bucket, selected_type, input_value]):
         return ''
 
-    bucket_name = selected_bucket
-    files = search_files(bucket_name, input_value)
+    # Initialize S3 client
+    access_key = 'your-access-key'
+    secret_key = 'your-secret-key'
+    endpoint = 'your-endpoint'
+    s3_client = initialize_s3_client(access_key, secret_key, endpoint)
 
-    links = [html.A(file, href=f'https://{bucket_name}.s3.amazonaws.com/{file}', target='_blank') for file in files]
+    files = search_files(s3_client, selected_bucket, input_value)
+
+    links = [html.A(file, href=f'https://{selected_bucket}.s3.amazonaws.com/{file}', target='_blank') for file in files]
     return html.Ul([html.Li(link) for link in links])
 
 if __name__ == '__main__':
