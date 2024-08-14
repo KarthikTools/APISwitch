@@ -1,0 +1,231 @@
+import dash
+from dash import dcc, html
+from dash.dependencies import Input, Output, State, ALL
+import boto3
+from botocore.exceptions import NoCredentialsError, ClientError
+from urllib.parse import urlparse
+import threading
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+
+# Initialize the Dash app
+app = dash.Dash(__name__, suppress_callback_exceptions=True)
+
+# Initialize the S3 client
+def initialize_s3_client(access_key, secret_key, endpoint, verify_ssl=False):
+    parsed_url = urlparse(endpoint)
+    host = parsed_url.hostname
+    port = parsed_url.port
+    session = boto3.Session(
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    )
+    s3_client = session.client('s3', endpoint_url=f"https://{host}:{port}", verify=verify_ssl)
+    return s3_client
+
+# Function to list files in a bucket with pagination
+def list_files(s3_client, bucket_name, max_files=100):
+    paginator = s3_client.get_paginator('list_objects_v2')
+    page_iterator = paginator.paginate(Bucket=bucket_name, PaginationConfig={'PageSize': max_files})
+    files = []
+    for page in page_iterator:
+        files.extend([obj['Key'] for obj in page.get('Contents', [])])
+        if len(files) >= max_files:
+            break
+    return files
+
+# Function to search files containing a specific term using threads
+def search_files_recursive(s3_client, bucket_name, search_term, prefix=''):
+    matching_files = []
+    paginator = s3_client.get_paginator('list_objects_v2')
+    page_iterator = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
+
+    def process_page(page):
+        if "Contents" in page:
+            for obj in page['Contents']:
+                file_name = obj['Key']
+                if search_term in file_name:
+                    matching_files.append(file_name)
+        if "CommonPrefixes" in page:
+            for prefix in page['CommonPrefixes']:
+                sub_prefix = prefix['Prefix']
+                matching_files.extend(search_files_recursive(s3_client, bucket_name, search_term, sub_prefix))
+
+    threads = []
+    for page in page_iterator:
+        thread = threading.Thread(target=process_page, args=(page,))
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    return matching_files
+
+# Define environment buckets
+env_buckets = {
+    'IST': ['gdg0-u-adapter-global-disbursements', 'gdg0-u-bulk-global-disbursements'],
+    'QA': ['gdg0-q-adapter-global-disbursements', 'gdg0-q-bulk-global-disbursements']
+}
+
+# Define the Dash app layout with modifications
+app.layout = html.Div([
+    html.H1('S3 File Viewer', style={'margin-bottom': '20px'}),
+    dcc.Dropdown(
+        id='env-dropdown',
+        options=[{'label': env, 'value': env} for env in env_buckets.keys()],
+        placeholder='Select Environment',
+        style={'margin-bottom': '10px', 'width': '200px'}
+    ),
+    html.Div([
+        dcc.Input(id='railbulk-id-input', type='text', placeholder='Enter rail-bulk-id', style={'margin-right': '10px', 'height': '50px', 'width': '300px'}),
+        dcc.Input(id='bulk-id-input', type='text', placeholder='Enter bulk-id', style={'height': '50px', 'width': '300px'}),
+    ], style={'margin-bottom': '10px', 'display': 'flex', 'align-items': 'center'}),
+    html.Div([
+        html.Button('Search', id='search-button', style={'width': '100px'}),
+    ], style={'display': 'flex', 'justify-content': 'center', 'margin-top': '20px'}),
+    html.Div(id='file-links', style={'margin-top': '20px'}),
+    html.Div([
+        html.Button('Edit', id='edit-button', style={'margin-right': '10px'}),
+        html.Button('Delete', id='delete-button', style={'margin-right': '10px'}),
+        html.Button('Download', id='download-button')
+    ], style={'display': 'flex', 'justify-content': 'center', 'margin-top': '20px'}),
+    dcc.Interval(id='interval-component', interval=15*60*1000, n_intervals=0),
+    html.Div(id='file-content', style={'margin-top': '20px'})
+])
+
+# Define the callback to update the output
+@app.callback(
+    Output('file-links', 'children'),
+    Input('search-button', 'n_clicks'),
+    State('railbulk-id-input', 'value'), 
+    State('bulk-id-input', 'value'),
+    State('env-dropdown', 'value')
+)
+def update_output(n_clicks, railbulk_id_input, bulk_id_input, selected_env):
+    if n_clicks is None or selected_env is None:
+        return ''
+
+    # Initialize S3 client
+    access_key = ''
+    secret_key = ''
+    endpoint = ''
+    s3_client = initialize_s3_client(access_key, secret_key, endpoint)
+
+    files = []
+
+    # Determine which buckets to search based on input
+    if railbulk_id_input and not bulk_id_input:
+        files.extend(search_files_recursive(s3_client, env_buckets[selected_env][0], railbulk_id_input))
+    elif bulk_id_input and not railbulk_id_input:
+        files.extend(search_files_recursive(s3_client, env_buckets[selected_env][1], bulk_id_input))
+    elif railbulk_id_input and bulk_id_input:
+        files.extend(search_files_recursive(s3_client, env_buckets[selected_env][0], railbulk_id_input))
+        files.extend(search_files_recursive(s3_client, env_buckets[selected_env][1], bulk_id_input))
+
+    # Generate links for the files with radio buttons
+    links = []
+    for index, file in enumerate(files):
+        links.append(html.Div(children=[
+            dcc.RadioItems(
+                options=[
+                    {'label': 'Select', 'value': 'select'},
+                    {'label': 'Deselect', 'value': 'deselect'}
+                ],
+                value='deselect',
+                id={'type': 'file-radio', 'index': index}
+            ),
+            html.A(file, href=f'/display_xml?filename={file}&env={selected_env}', target='_blank'),
+        ], key=f'file-link-{index}'))
+
+    return html.Div(links)
+
+# Define the callback to handle file operations
+@app.callback(
+    Output('file-content', 'children'),
+    Input('edit-button', 'n_clicks'),
+    Input('delete-button', 'n_clicks'),
+    Input('download-button', 'n_clicks'),
+    Input({'type': 'file-radio', 'index': ALL}, 'value'),
+    State({'type': 'file-radio', 'index': ALL}, 'id'),
+    State('file-links', 'children'),
+    State('env-dropdown', 'value')
+)
+def handle_file_operations(edit_clicks, delete_clicks, download_clicks, selected_files, filenames, selected_env):
+    ctx = dash.callback_context
+
+    if not ctx.triggered or selected_env is None:
+        raise PreventUpdate
+
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    # Initialize S3 client
+    access_key = ''
+    secret_key = ''
+    endpoint = 'https://s3'
+    s3_client = initialize_s3_client(access_key, secret_key, endpoint)
+
+    # Handle Edit Operation
+    if button_id == 'edit-button':
+        selected_filenames = [filenames[i]['index'] for i, val in enumerate(selected_files) if val == 'select']
+        if not selected_filenames:
+            return html.Div("No files selected for editing.", key='no-files-selected')
+        
+        # Fetch, edit, and re-upload file content
+        edited_files = []
+        for index in selected_filenames:
+            filename = filenames[index]['index']
+            try:
+                file_content = s3_client.get_object(Bucket=env_buckets[selected_env][0], Key=filename)['Body'].read().decode('utf-8')
+                # Here you would add the logic to edit the content
+                edited_content = file_content + "\n# Edited Content"
+                # Upload the edited content back to S3
+                s3_client.put_object(Bucket=env_buckets[selected_env][0], Key=filename, Body=edited_content.encode('utf-8'))
+                edited_files.append(filename)
+            except ClientError as e:
+                return html.Div(f"Error editing file: {e}", key=f'error-{filename}')
+
+        return html.Div(f"Edited files: {', '.join(edited_files)}", key=f'edit-files-{", ".join(edited_files)}')
+
+    # Handle Delete Operation
+    elif button_id == 'delete-button':
+        selected_filenames = [filenames[i]['index'] for i, val in enumerate(selected_files) if val == 'select']
+        if not selected_filenames:
+            return html.Div("No files selected for deletion.", key='no-files-selected')
+        
+        deleted_files = []
+        for index in selected_filenames:
+            filename = filenames[index]['index']
+            try:
+                s3_client.delete_object(Bucket=env_buckets[selected_env][0], Key=filename)
+                deleted_files.append(filename)
+            except ClientError as e:
+                return html.Div(f"Error deleting file: {e}", key=f'error-{filename}')
+
+        return html.Div(f"Deleted files: {', '.join(deleted_files)}", key=f'delete-files-{", ".join(deleted_files)}')
+
+    # Handle Download Operation
+    elif button_id == 'download-button':
+        selected_filenames = [filenames[i]['index'] for i, val in enumerate(selected_files) if val == 'select']
+        if not selected_filenames:
+            return html.Div("No files selected for downloading.", key='no-files-selected')
+        
+        downloaded_files = []
+        for index in selected_filenames:
+            filename = filenames[index]['index']
+            try:
+                file_content = s3_client.get_object(Bucket=env_buckets[selected_env][0], Key=filename)['Body'].read()
+                with open(filename, 'wb') as f:
+                    f.write(file_content)
+                downloaded_files.append(filename)
+            except ClientError as e:
+                return html.Div(f"Error downloading file: {e}", key=f'error-{filename}')
+
+        return html.Div(f"Downloaded files: {', '.join(downloaded_files)}", key=f'download-files-{", ".join(downloaded_files)}')
+
+    raise PreventUpdate
+
+if __name__ == '__main__':
+    app.run_server(debug=True, port=8053)
